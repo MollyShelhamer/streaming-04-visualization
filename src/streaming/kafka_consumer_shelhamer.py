@@ -51,6 +51,7 @@ from datafun_streaming.kafka.kafka_settings import KafkaSettings
 from datafun_streaming.stats.stats_utils import RunningStats
 from datafun_toolkit.logger import get_logger, log_header, log_path
 from dotenv import load_dotenv
+import matplotlib.pyplot as plt
 
 from streaming.core.utils import log_env_vars
 from streaming.data_engineering.derived_fields import enrich_message
@@ -89,6 +90,7 @@ OUTPUT_DIR: Final[Path] = DATA_DIR / "output"
 
 OUTPUT_CSV: Final[Path] = OUTPUT_DIR / "consumed_sales.csv"
 OUTPUT_CHART: Final[Path] = OUTPUT_DIR / "sales_chart_case.png"
+SECONDARY_OUTPUT_CHART: Final[Path] = OUTPUT_DIR / "sales_by_region.png"
 
 REGIONS_CSV: Final[Path] = DATA_DIR / "regions.csv"
 PRODUCTS_CSV: Final[Path] = DATA_DIR / "products.csv"
@@ -111,6 +113,7 @@ def log_paths() -> None:
     log_path(LOG, "DATA_DIR", DATA_DIR)
     log_path(LOG, "OUTPUT_CSV", OUTPUT_CSV)
     log_path(LOG, "OUTPUT_CHART", OUTPUT_CHART)
+    log_path(LOG, "SECONDARY_OUTPUT_CHART", SECONDARY_OUTPUT_CHART)
     log_path(LOG, "REGIONS_CSV", REGIONS_CSV)
     log_path(LOG, "PRODUCTS_CSV", PRODUCTS_CSV)
     log_path(LOG, "CURRENCIES_CSV", CURRENCIES_CSV)
@@ -203,13 +206,23 @@ def get_kafka_consumer(settings: KafkaSettings) -> Any:
 # ===========================================================================
 
 
-def initialize_output() -> tuple[Any, Any, list[int], list[float], RunningStats]:
+def initialize_output() -> tuple[
+    Any,
+    Any,
+    list[int],
+    list[float],
+    Any,
+    Any,
+    dict[str, float],
+    RunningStats,
+]:
     """Initialize output directory, CSV, chart, and stats.
 
-    NEW: Very similar to earlier, but now also provides a chart.
+    NEW: Very similar to earlier, but now also provides two charts.
 
     Returns:
-        A tuple of (figure, axis, x_values, y_values, stats).
+        A tuple of (figure, axis, x_values, y_values, region_figure,
+        region_axis, region_totals, stats).
     """
     LOG.info("Initializing output...")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -222,12 +235,64 @@ def initialize_output() -> tuple[Any, Any, list[int], list[float], RunningStats]
     figure, axis, x_values, y_values = init_live_chart()
     LOG.info("Live chart initialized.")
 
-    # NEW: We can't just return RunningStats(),
-    # So assign it to a variable first and then include it in the return statement.
+    # NEW: Initialize a second chart for totals by region.
+    region_figure, region_axis, region_totals = init_region_chart()
+    LOG.info("Region chart initialized.")
+
     stats = RunningStats()
 
-    # NEW: Update the return statement to include chart features as well.
-    return figure, axis, x_values, y_values, stats
+    return (
+        figure,
+        axis,
+        x_values,
+        y_values,
+        region_figure,
+        region_axis,
+        region_totals,
+        stats,
+    )
+
+
+def init_region_chart() -> tuple[Any, Any, dict[str, float]]:
+    """Create a secondary live chart for sales totals by region."""
+    figure, axis = plt.subplots()
+    axis.set_title("Cumulative Sales Total by Region")
+    axis.set_xlabel("Region ID")
+    axis.set_ylabel("Sales Total ($)")
+    axis.set_facecolor("#f9f9f9")
+    figure.show()
+    figure.canvas.draw()
+    figure.canvas.flush_events()
+    return figure, axis, {}
+
+
+def update_region_chart(
+    *,
+    figure: Any,
+    axis: Any,
+    region_totals: dict[str, float],
+    message: dict[str, Any],
+) -> None:
+    """Update the secondary region chart with one consumed message."""
+    region_id = str(message.get("region_id", "unknown"))
+    region_totals[region_id] = region_totals.get(region_id, 0.0) + float(
+        message["total"]
+    )
+
+    axis.clear()
+    axis.bar(
+        list(region_totals.keys()),
+        list(region_totals.values()),
+        color="#2ca02c",
+        alpha=0.85,
+    )
+    axis.set_title("Cumulative Sales Total by Region")
+    axis.set_xlabel("Region ID")
+    axis.set_ylabel("Sales Total ($)")
+    axis.grid(axis="y", linestyle="--", alpha=0.35)
+    figure.canvas.draw()
+    figure.canvas.flush_events()
+    plt.pause(0.05)
 
 
 def load_reference_data() -> dict[str, float]:
@@ -258,6 +323,9 @@ def process_message(
     axis: Any,
     x_values: list[int],
     y_values: list[float],
+    region_figure: Any,
+    region_axis: Any,
+    region_totals: dict[str, float],
 ) -> dict[str, Any] | None:
     """Process one consumed message.
 
@@ -282,6 +350,9 @@ def process_message(
         axis: Matplotlib axis.
         x_values: List of x-axis values already shown.
         y_values: List of y-axis values already shown.
+        region_figure: Secondary Matplotlib figure for the region totals chart.
+        region_axis: Secondary Matplotlib axis for the region totals chart.
+        region_totals: Cumulative sales totals keyed by region_id.
 
     Returns:
         The enriched row, or None if validation failed.
@@ -313,12 +384,16 @@ def process_message(
         message=enriched,
     )
 
-    # NEW: Call the figure.canvas.flush_events() method
-    # to process any pending GUI events,
-    # which helps the chart to update properly.
-    figure.canvas.flush_events()
+    update_region_chart(
+        figure=region_figure,
+        axis=region_axis,
+        region_totals=region_totals,
+        message=enriched,
+    )
 
-    # return the enriched message for further processing as before.
+    figure.canvas.flush_events()
+    region_figure.canvas.flush_events()
+
     return enriched
 
 
@@ -331,6 +406,9 @@ def consume_messages(
     axis: Any,
     x_values: list[int],
     y_values: list[float],
+    region_figure: Any,
+    region_axis: Any,
+    region_totals: dict[str, float],
 ) -> tuple[int, int]:
     """Consume and process messages from the Kafka topic.
 
@@ -349,6 +427,9 @@ def consume_messages(
         axis: Matplotlib axis.
         x_values: List of x-axis values already shown.
         y_values: List of y-axis values already shown.
+        region_figure: Secondary Matplotlib figure for the region totals chart.
+        region_axis: Secondary Matplotlib axis for the region totals chart.
+        region_totals: Cumulative sales totals keyed by region_id.
 
     Returns:
         A tuple of (consumed_count, skipped_count).
@@ -383,6 +464,9 @@ def consume_messages(
             axis=axis,
             x_values=x_values,
             y_values=y_values,
+            region_figure=region_figure,
+            region_axis=region_axis,
+            region_totals=region_totals,
         )
 
         if enriched is None:
@@ -412,21 +496,22 @@ def consume_messages(
     return consumed_count, skipped_count
 
 
-def save_artifacts(figure: Any) -> None:
+def save_artifacts(figure: Any, region_figure: Any) -> None:
     """Save output artifacts or note their location.
 
-    NEW: Updated to include saving the live chart.
+    NEW: Updated to include saving the live chart and secondary region chart.
 
     Arguments:
         figure: Matplotlib figure to save as an image.
+        region_figure: Secondary figure for region totals.
     """
     LOG.info("Saving artifacts...")
 
-    # NEW: Save the live chart as an image file.
     save_live_chart(figure=figure, chart_path=OUTPUT_CHART)
+    save_live_chart(figure=region_figure, chart_path=SECONDARY_OUTPUT_CHART)
 
-    # UPDATED: Log paths to the saved artifacts.
     log_path(LOG, "WROTE OUTPUT_CHART", OUTPUT_CHART)
+    log_path(LOG, "WROTE SECONDARY_OUTPUT_CHART", SECONDARY_OUTPUT_CHART)
     log_path(LOG, "WROTE OUTPUT_CSV", OUTPUT_CSV)
 
 
@@ -450,6 +535,7 @@ def log_summary(
     LOG.info(f"Skipped  {skipped_count} message(s).")
     log_path(LOG, "OUTPUT_CSV", OUTPUT_CSV)
     log_path(LOG, "OUTPUT_CHART", OUTPUT_CHART)
+    log_path(LOG, "SECONDARY_OUTPUT_CHART", SECONDARY_OUTPUT_CHART)
 
     if stats.count > 0:
         LOG.info(f"  Total sales:  ${stats.total:,.2f}")
@@ -486,7 +572,16 @@ def main() -> None:
 
     # NEW: Add visualization parameters to the
     # unpacking of initialize_output().
-    figure, axis, x_values, y_values, stats = initialize_output()
+    (
+        figure,
+        axis,
+        x_values,
+        y_values,
+        region_figure,
+        region_axis,
+        region_totals,
+        stats,
+    ) = initialize_output()
 
     region_lookup = load_reference_data()
 
@@ -498,8 +593,6 @@ def main() -> None:
     # - The live chart should close after consuming and saving artifacts.
     try:
         try:
-            # NEW: Updated consume_messages() call
-            # includes visualization parameters and logic.
             consumed_count, skipped_count = consume_messages(
                 consumer,
                 region_lookup=region_lookup,
@@ -508,6 +601,9 @@ def main() -> None:
                 axis=axis,
                 x_values=x_values,
                 y_values=y_values,
+                region_figure=region_figure,
+                region_axis=region_axis,
+                region_totals=region_totals,
             )
         finally:
             # Close the Kafka consumer in the inner finally block
@@ -517,10 +613,9 @@ def main() -> None:
 
         # NEW: When we call save_artifacts(),
         # pass in the chart for saving as well.
-        save_artifacts(figure)
+        save_artifacts(figure, region_figure)
 
     finally:
-        # NEW: Call the function to close the live chart after saving artifacts.
         close_live_chart()
         LOG.info("Live chart closed.")
 
